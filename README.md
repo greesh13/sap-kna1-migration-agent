@@ -1,12 +1,12 @@
 # SAP KNA1 Migration Agent
 
-Built a SAP KNA1 customer master data migration agent inspired by enterprise engagements in manufacturing and supply chain. Synthetic data modeled after real KNA1 schemas used in large-scale SAP-to-CRM migrations at companies like Honeywell. Demonstrates the architecture used in production migration pipelines.
+Built a SAP KNA1 customer master data migration agent inspired by enterprise engagements in manufacturing and supply chain. Synthetic data modeled after real KNA1 schemas used in large-scale SAP-to-CRM migrations at companies like Honeywell. Demonstrates the architecture used in production migration pipelines — including autonomous agent orchestration, data validation, field mapping, cleansing, SQLite persistence, and post-load database verification.
 
 ---
 
 ## Overview
 
-An end-to-end agentic migration pipeline that takes SAP KNA1 customer master records and migrates them to a target CRM schema. The agent uses Claude claude-sonnet-4-6 with tool_use to autonomously orchestrate the migration pipeline — deciding which tools to call, in what order, and interpreting results between each step.
+An end-to-end agentic migration pipeline that takes SAP KNA1 customer master records and migrates them to a target CRM schema. The agent uses Claude claude-sonnet-4-6 with tool_use to autonomously orchestrate the pipeline — deciding which tools to call, in what order, and interpreting results between each step. Clean records are written to a SQLite database and verified post-load.
 
 ---
 
@@ -15,18 +15,21 @@ An end-to-end agentic migration pipeline that takes SAP KNA1 customer master rec
 ```
 SAP KNA1 Source Data (500 records)
         ↓
-┌─────────────────────────────────────┐
-│          Migration Agent            │
-│                                     │
-│  Claude claude-sonnet-4-6 (tool_use loop)  │
-│                                     │
-│  ├── validate_schema                │
-│  ├── validate_data                  │
-│  ├── map_fields                     │
-│  └── transform_and_cleanse          │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│            Migration Agent               │
+│                                          │
+│  Claude claude-sonnet-4-6 (tool_use loop)│
+│                                          │
+│  ├── validate_schema                     │
+│  ├── validate_data                       │
+│  ├── map_fields                          │
+│  ├── transform_and_cleanse               │
+│  └── verify_database                     │
+└──────────────────────────────────────────┘
         ↓
-Migration Report + Clean CRM Records
+SQLite Database (data/migrated/customer_master.db)
+        ↓
+Migration Report + Verification Output
 ```
 
 ---
@@ -61,7 +64,14 @@ Maps 19 KNA1 source fields to target CRM schema:
 - Cleans US postal codes to 5-digit ZIP
 - Resets invalid flag values
 - Truncates fields exceeding CRM max length
-- Routes records to passed or rejected based on validation outcome
+- Rejects records where any mandatory field is blank after cleansing
+- Writes all passed records to SQLite via pandas `to_sql` + SQLAlchemy
+
+### 5. Database Verification
+After load, connects to `customer_master.db` and confirms:
+- Row count via `SELECT COUNT(*)`
+- 5 sample records printed as a rich terminal table
+- All 8 mandatory CRM fields verified non-null across every loaded record
 
 ---
 
@@ -70,16 +80,21 @@ Maps 19 KNA1 source fields to target CRM schema:
 ```
 sap-kna1-migration-agent/
 ├── config/
-│   └── schemas.py          # KNA1 + CRM schema definitions, field mapping
+│   └── schemas.py              # KNA1 + CRM schema definitions, field mapping
 ├── data/
-│   └── synthetic/
-│       └── generate.py     # 500-row KNA1 synthetic data generator
+│   ├── synthetic/
+│   │   ├── generate.py         # 500-row KNA1 synthetic data generator with injected errors
+│   │   └── kna1_raw.json       # Generated source dataset
+│   └── migrated/
+│       └── customer_master.db  # SQLite database of migrated CRM records
 ├── tools/
-│   ├── schema.py           # Schema validation tool
-│   ├── validation.py       # Data quality validation tool
-│   ├── mapping.py          # Field mapping tool
-│   └── transformation.py   # Cleansing and transformation tool
-├── main.py                 # Migration agent orchestrator
+│   ├── schema.py               # Schema validation tool
+│   ├── validation.py           # Data quality validation tool
+│   ├── mapping.py              # Field mapping tool
+│   ├── transformation.py       # Cleansing, transformation, and SQLite write
+│   └── verify.py               # Post-load database verification tool
+├── main.py                     # Migration agent orchestrator
+├── migration_report.md         # Last run migration report
 ├── requirements.txt
 └── README.md
 ```
@@ -109,7 +124,36 @@ python main.py
 python main.py
 ```
 
-Standalone mode runs the full pipeline as a direct Python orchestration — same results, no API credits required.
+Standalone mode runs the full pipeline as direct Python orchestration — same results, no API credits required.
+
+---
+
+## Sample Verification Output
+
+```
+5 Sample Records from CUSTOMER_MASTER
+──────────────────────────────────────────────────────────────────────
+customer_id   full_name                city          postal_code   account_group
+0001000001    Boyd, Monroe and Wilson  Port Stevens  73421         0001
+0001000002    Johns Robert             New Antonia   98034         0001
+0001000003    Allen, Odom and Doyle    South Adams   90210         0002
+0001000004    Mcdonald                 Port Victor   66012         0001
+0001000005    Green                    Shannonville  49301         KRED
+
+Mandatory Field Null Check
+──────────────────────────────────────────
+Field            Null/Empty Rows   Status
+customer_id      0                 ✓ OK
+full_name        0                 ✓ OK
+city             0                 ✓ OK
+postal_code      0                 ✓ OK
+country          0                 ✓ OK
+account_group    0                 ✓ OK
+created_date     0                 ✓ OK
+created_by       0                 ✓ OK
+
+row_count: 444   mandatory_ok: True
+```
 
 ---
 
@@ -117,14 +161,14 @@ Standalone mode runs the full pipeline as a direct Python orchestration — same
 
 ```
 Total records        500
-Records passed       446
-Records rejected      54
-Pass rate           89.2%
+Records passed       444
+Records rejected      56
+Pass rate           88.8%
 
 Top issues:
 1. allowed_values    41   (invalid country codes, account groups)
-2. max_length        18   (NAME1 exceeds 35-char limit)
-3. required          18   (blank mandatory fields)
+2. required          18   (blank mandatory fields)
+3. max_length        17   (NAME1 exceeds 35-char limit)
 4. business_rule     15   (SPERR + LOEVM both flagged)
 5. date_format       10   (non-ISO ERDAT values)
 ```
@@ -153,5 +197,6 @@ Top issues:
 
 - Python 3.11+
 - Anthropic Claude API (claude-sonnet-4-6)
+- pandas + SQLAlchemy (SQLite persistence)
 - Faker (synthetic data generation)
 - Rich (terminal reporting)
