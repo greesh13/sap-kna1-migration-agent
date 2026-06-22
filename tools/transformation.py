@@ -13,8 +13,26 @@ Rules applied:
 """
 
 import json
+import os
 import re
+
+import pandas as pd
+from sqlalchemy import create_engine
+
 from config.schemas import CRM_SCHEMA, VALID_COUNTRIES
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "migrated", "customer_master.db")
+TABLE_NAME = "CUSTOMER_MASTER"
+
+
+def write_to_db(passed_rows: list[dict]) -> str:
+    """Write passed rows to SQLite via pandas + sqlalchemy."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    engine = create_engine(f"sqlite:///{os.path.abspath(DB_PATH)}")
+    df = pd.DataFrame(passed_rows)
+    df.to_sql(TABLE_NAME, con=engine, if_exists="replace", index=False)
+    engine.dispose()
+    return os.path.abspath(DB_PATH)
 
 
 def _clean_phone(val: str) -> str:
@@ -91,10 +109,18 @@ def transform_and_cleanse(mapped_rows: list[dict], validation_errors: dict) -> d
             warnings_list.append({"customer_id": row.get("customer_id"), "warnings": w})
 
         # route to passed / rejected
-        if row.get("customer_id", "") in error_kunnrs:
+        # also reject if any mandatory CRM field is blank after cleansing
+        mandatory_blank = any(
+            not row.get(f, "").strip()
+            for f in ("customer_id", "full_name", "city", "postal_code",
+                      "country", "account_group", "created_date", "created_by")
+        )
+        if row.get("customer_id", "") in error_kunnrs or mandatory_blank:
             rejected.append(row)
         else:
             passed.append(row)
+
+    db_path = write_to_db(passed)
 
     return {
         "tool": "transform_and_cleanse",
@@ -103,6 +129,7 @@ def transform_and_cleanse(mapped_rows: list[dict], validation_errors: dict) -> d
         "rejected": len(rejected),
         "transformations_applied": transformations_applied,
         "warnings": warnings_list[:30],
+        "db_path": db_path,
         "passed_rows": passed,
         "rejected_rows": rejected,
     }

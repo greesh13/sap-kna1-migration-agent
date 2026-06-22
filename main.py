@@ -20,6 +20,7 @@ from tools import schema as schema_tool
 from tools import validation as validation_tool
 from tools import mapping as mapping_tool
 from tools import transformation as transformation_tool
+from tools import verify as verify_tool
 
 console = Console()
 
@@ -30,6 +31,7 @@ TOOLS = [
     validation_tool.TOOL_DEF,
     mapping_tool.TOOL_DEF,
     transformation_tool.TOOL_DEF,
+    verify_tool.TOOL_DEF,
 ]
 
 # ── state shared across tool calls ────────────────────────────────────────
@@ -67,10 +69,12 @@ def dispatch_tool(name: str, tool_input: dict) -> str:
             STATE["validation_result"],
         )
         STATE["transform_result"] = result
-        # return summary without full row lists
         summary = {k: v for k, v in result.items()
                    if k not in ("passed_rows", "rejected_rows")}
         return json.dumps(summary, indent=2)
+
+    if name == "verify_database":
+        return verify_tool.run_tool(tool_input)
 
     return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -80,13 +84,14 @@ def dispatch_tool(name: str, tool_input: dict) -> str:
 SYSTEM_PROMPT = """You are an expert SAP data migration agent.
 Your job is to migrate SAP KNA1 customer master records to a target CRM system.
 
-You have four tools available (call them in this order):
-1. validate_schema  — check structural completeness of the source data
-2. validate_data    — run field-level validation (required, lengths, allowed values, dates, duplicates)
-3. map_fields       — apply the KNA1→CRM field mapping
-4. transform_and_cleanse — cleanse and normalise mapped data; separate passed vs rejected rows
+You have five tools available (call them in this order):
+1. validate_schema       — check structural completeness of the source data
+2. validate_data         — run field-level validation (required, lengths, allowed values, dates, duplicates)
+3. map_fields            — apply the KNA1→CRM field mapping
+4. transform_and_cleanse — cleanse and normalise mapped data; write passed rows to SQLite DB
+5. verify_database       — confirm row count, print 5 sample records, verify mandatory fields non-null
 
-After all four tools have run, produce a final migration report in this exact structure:
+After all five tools have run, produce a final migration report in this exact structure:
 
 ## SAP KNA1 Migration Report
 **Date:** <today>
@@ -193,11 +198,17 @@ def run_agent_standalone(n_rows: int) -> str:
     STATE["mapped_rows"] = map_result.get("mapped_rows", [])
     console.print(f"   mapped_rows: {map_result.get('mapped_count', len(STATE['mapped_rows']))}")
 
-    # Step 4: transform & cleanse
+    # Step 4: transform & cleanse → writes to SQLite
     console.print("[cyan]→ Tool:[/cyan] [bold]transform_and_cleanse[/bold]")
     tx_result = transformation_tool.run_tool({"run": True}, STATE["mapped_rows"], STATE["validation_result"])
     STATE["transform_result"] = tx_result
     console.print(f"   passed: {tx_result['passed']}  rejected: {tx_result['rejected']}")
+    console.print(f"   db: {tx_result.get('db_path', '')}")
+
+    # Step 5: verify database
+    console.print("[cyan]→ Tool:[/cyan] [bold]verify_database[/bold]")
+    verify_result = json.loads(verify_tool.run_tool({"run": True}))
+    console.print(f"   row_count: {verify_result.get('row_count')}  mandatory_ok: {verify_result.get('all_mandatory_ok')}")
 
     # ── build report ───────────────────────────────────────────────────────
     v = val_result
